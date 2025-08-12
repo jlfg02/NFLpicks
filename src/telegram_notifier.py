@@ -76,30 +76,68 @@ def build_features_current(odds_df, elo_now, rpd_now):
     df['home_flag'] = 1
     return df
 
-def decide_picks(df, edge_pts):
+def decide_picks(df, edge_pts=None):
+    """
+    Decide pick por probabilidad de cubrir (sin umbral).
+    - p_home_cover = σ(alpha * (margin_pred_adj + market_spread_home))
+    - pick_side = HOME si p_home_cover >= 0.5, si no AWAY
+    - confidence = prob del lado elegido (0.50–1.00)
+    """
+    alpha = float(CFG.get('PROB_ALPHA', 0.25))
     out = df.copy()
-    out['edge_pts'] = out['model_spread_home'] - out['market_spread_home']
-    picks, confs = [], []
-    for _, r in out.iterrows():
-        side = None
-        if abs(r['edge_pts']) >= edge_pts:
-            side = 'HOME' if r['edge_pts'] < 0 else 'AWAY'
-        conf = min(1.0, abs(r['edge_pts'])/(edge_pts+1e-9))
-        picks.append(side); confs.append(conf)
-    out['pick_side'] = picks; out['confidence'] = confs
+
+    # seguimos mostrando el edge
+    out['edge_pts'] = out['model_spread_home_adj'] - out['market_spread_home']
+
+    # prob de que el LOCAL cubra su spread del mercado
+    z = out['margin_pred_adj'] + out['market_spread_home']
+    p_home_cover = 1.0 / (1.0 + np.exp(-alpha * z))
+    out['p_home_cover'] = p_home_cover
+
+    # pick por probabilidad (sin umbral)
+    out['pick_side'] = np.where(out['p_home_cover'] >= 0.5, 'HOME', 'AWAY')
+    out['p_cover_pick'] = np.where(
+        out['pick_side'].eq('HOME'),
+        out['p_home_cover'],
+        1 - out['p_home_cover']
+    )
+
+    # confianza = prob del lado elegido (0.50..1.00)
+    out['confidence'] = out['p_cover_pick']
+
     return out
 
-def compose_message(title, picks_df):
+def compose_message(title: str, picks_df: pd.DataFrame, injuries: dict) -> str:
+    """
+    Ordena TODOS los picks por 'confidence' desc y muestra:
+    Market, Model (ajustado), Edge, Ajuste lesiones, Pick, Confianza%, Prob. cubrir%, y lesiones.
+    """
     lines = [f"*{title}*"]
-    if picks_df.empty or picks_df['pick_side'].isna().all():
-        lines.append(f"_Sin edge ≥ {CFG['EDGE_PTS']} pts. PASS._")
+    if picks_df.empty:
+        lines.append("_No hay partidos disponibles._")
         return "\n".join(lines)
-    top = picks_df.sort_values('confidence', ascending=False).head(3)
-    for _, r in top.iterrows():
+
+    # Ordena por certeza (prob del lado elegido)
+    df = picks_df.sort_values('confidence', ascending=False).reset_index(drop=True)
+
+    for _, r in df.iterrows():
+        conf_pct = int(round(100 * float(r['confidence'])))
+        p_cover_pct = int(round(100 * float(r['p_cover_pick'])))
+
         lines.append(f"{r['away']} @ {r['home']}")
-        lines.append(f"Market (home): {r['market_spread_home']:+.1f} | Model: {r['model_spread_home']:+.1f} | Edge: {r['edge_pts']:+.1f}")
-        lines.append(f"Pick: *{r['pick_side']}* | Confianza: {r['confidence']:.2f}")
-        lines.append("— Motivos: Elo y forma (RPD); lesiones si disponibles.\n")
+        lines.append(f"Market (home): {r['market_spread_home']:+.1f} | Model: {r['model_spread_home_adj']:+.1f} | Edge: {r['edge_pts']:+.1f}")
+        lines.append(f"Ajuste lesiones (home-away): {r['inj_diff_pts']:+.1f} pts")
+        lines.append(f"Pick: *{r['pick_side']}* | Confianza: {conf_pct}% | Prob. cubrir: {p_cover_pct}%")
+
+        h_code = TEAM_MAP.get(r['home']); a_code = TEAM_MAP.get(r['away'])
+        if injuries and h_code in injuries and a_code in injuries:
+            ih, ia = injuries[h_code], injuries[a_code]
+            lines.append(f"Lesiones: {a_code} QB {ia['qb']}, outs {ia['outs']} vs {h_code} QB {ih['qb']}, outs {ih['outs']}")
+        else:
+            lines.append("Lesiones: N/D")
+
+        lines.append("— Motivos: Elo y forma (RPD) + ajuste por lesiones.\n")
+
     return "\n".join(lines).strip()
 
 def send_telegram(msg, token, chat_id, parse_mode="Markdown"):
