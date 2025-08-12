@@ -228,4 +228,209 @@ def decide_picks(df, edge_pts=None):
     # prob de que el LOCAL cubra su spread del mercado
     z = out['margin_pred_adj'] + out['market_spread_home']
     p_home_cover = 1.0 / (1.0 + np.exp(-alpha * z))
-    out['p_home_cover'] = p_home_cov
+    out['p_home_cover'] = p_home_cover
+
+    # pick por probabilidad (sin umbral)
+    out['pick_side'] = np.where(out['p_home_cover'] >= 0.5, 'HOME', 'AWAY')
+    out['p_cover_pick'] = np.where(out['pick_side'].eq('HOME'), out['p_home_cover'], 1 - out['p_home_cover'])
+
+    # confianza = prob del lado elegido (0.50..1.00)
+    out['confidence'] = out['p_cover_pick']
+
+    return out
+
+# --------------------------------------------------------------------------------------
+# MENSAJES: TOP-N DETALLADOS + RESTO EN "MENCIONES RÁPIDAS" + SPLIT
+# --------------------------------------------------------------------------------------
+def compose_messages(title: str, picks_df: pd.DataFrame, injuries: dict, chunk_limit: int = 3500) -> list:
+    """
+    Devuelve una lista de mensajes (strings) ya cortados por longitud.
+    - Ordena por 'confidence' desc
+    - Muestra Top-N con detalle y el resto como "menciones rápidas"
+    - Corta en chunks seguros para Telegram
+    """
+    header = f"*{title}*"
+    if picks_df.empty:
+        return [header + "\n_No hay partidos disponibles._"]
+
+    top_n = int(CFG.get("MAX_PICKS_DETAIL", 12))
+    df = picks_df.sort_values('confidence', ascending=False).reset_index(drop=True)
+    detailed = df.head(top_n)
+    quick = df.iloc[top_n:]
+
+    # Construir bloques detallados
+    detail_blocks = []
+    for _, r in detailed.iterrows():
+        conf_pct = int(round(100 * float(r['confidence'])))
+        p_cover_pct = int(round(100 * float(r['p_cover_pick'])))
+
+        lines = []
+        lines.append(f"{r['away']} @ {r['home']}")
+        lines.append(f"Market (home): {r['market_spread_home']:+.1f} | Model: {r['model_spread_home_adj']:+.1f} | Edge: {r['edge_pts']:+.1f}")
+        lines.append(f"Ajuste lesiones (home-away): {r['inj_diff_pts']:+.1f} pts")
+        lines.append(f"Pick: *{r['pick_side']}* | Confianza: {conf_pct}% | Prob. cubrir: {p_cover_pct}%")
+
+        h_code = TEAM_MAP.get(r['home']); a_code = TEAM_MAP.get(r['away'])
+        if injuries and h_code in injuries and a_code in injuries:
+            ih, ia = injuries[h_code], injuries[a_code]
+            lines.append(f"Lesiones: {a_code} QB {ia['qb']}, outs {ia['outs']} vs {h_code} QB {ih['qb']}, outs {ih['outs']}")
+        else:
+            lines.append("Lesiones: N/D")
+
+        lines.append("— Motivos: Elo y forma (RPD) + ajuste por lesiones.\n")
+        detail_blocks.append("\n".join(lines))
+
+    # Construir sección de menciones rápidas
+    quick_blocks = []
+    if not quick.empty:
+        quick_blocks.append("— *Resto (menciones rápidas)* —")
+        for _, r in quick.iterrows():
+            conf_pct = int(round(100 * float(r['confidence'])))
+            edge = f"{float(r['edge_pts']):+0.1f}"
+            injd = f"{float(r['inj_diff_pts']):+0.1f}"
+            quick_line = f"• {r['away']} @ {r['home']}: *{r['pick_side']}*, Conf {conf_pct}%, Edge {edge}, InjΔ {injd}"
+            quick_blocks.append(quick_line)
+
+    # Empaquetar en mensajes sin superar el límite
+    messages = []
+    current = header
+    def try_add(block: str):
+        nonlocal current, messages
+        candidate = current + ("\n" if current else "") + block
+        if len(candidate) > chunk_limit:
+            messages.append(current)
+            current = header + " (cont.)\n" + block
+        else:
+            current = candidate
+
+    for b in detail_blocks:
+        try_add(b)
+    for b in quick_blocks:
+        try_add(b)
+
+    if current:
+        messages.append(current)
+
+    # Etiquetar partes si hay varias
+    if len(messages) > 1:
+        total = len(messages)
+        messages = [f"{m}\n_Parte {i}/{total}_" for i, m in enumerate(messages, 1)]
+
+    return messages
+
+# --------------------------------------------------------------------------------------
+# Envío a Telegram con logs
+# --------------------------------------------------------------------------------------
+def send_telegram(token: str, chat_id: str, text: str, parse_mode: str = "Markdown"):
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True}
+    r = requests.post(url, data=data, timeout=30)
+    try:
+        js = r.json()
+    except Exception:
+        js = {"raw": r.text}
+    print(f"[telegram] status={r.status_code} ok={js.get('ok')} desc={js.get('description')}")
+    r.raise_for_status()
+    if not js.get('ok', False):
+        raise RuntimeError(f"Telegram error: {js}")
+
+# --------------------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------------------
+def main(batch: str):
+    token   = os.environ.get('TELEGRAM_BOT_TOKEN')
+    chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+    odds_k  = os.environ.get('ODDS_API_KEY')
+    sdio_k  = os.environ.get('SPORTSDATAIO_KEY', '')  # opcional
+
+    assert token and chat_id and odds_k, "Faltan TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID u ODDS_API_KEY"
+
+    # 1) Entrena modelo de margen con históricos
+    hist = load_hist()
+    ridge, feats, rpd_now, elo_now = train_ridge(hist)
+
+    # 2) Lee odds actuales
+    odds = get_odds(odds_k)
+    if odds.empty:
+        send_telegram(token, chat_id, "*NFL Picks*: no hay odds disponibles ahora mismo.")
+        return
+
+    # 3) Ventana temporal por huso horario (America/Tijuana)
+    tz = CFG.get("TIMEZONE", "America/Tijuana")
+    odds['dt_utc'] = pd.to_datetime(odds['commence_time'], utc=True, errors='coerce')
+    odds['dt_local'] = odds['dt_utc'].dt.tz_convert(tz)
+
+    now_local = pd.Timestamp.now(tz=tz)
+    if batch == 'tnf':
+        # próximo jueves local (00:00–24:00)
+        days_to_thu = (3 - now_local.weekday()) % 7
+        thu = (now_local + pd.Timedelta(days=days_to_thu)).normalize()
+        start = thu
+        end = thu + pd.Timedelta(days=1)
+        title = "TNF (ATS)"
+        window_df = odds[(odds['dt_local'] >= start) & (odds['dt_local'] < end)].copy()
+    else:
+        # próximo viernes 00:00 -> martes 00:00 (incluye MNF)
+        days_to_fri = (4 - now_local.weekday()) % 7
+        fri = (now_local + pd.Timedelta(days=days_to_fri)).normalize()
+        mon = fri + pd.Timedelta(days=3)
+        start = fri
+        end = mon + pd.Timedelta(days=1)
+        title = "Weekend (ATS)"
+        window_df = odds[(odds['dt_local'] >= start) & (odds['dt_local'] < end)].copy()
+
+    # quita duplicados por (home, away), quedándote con el más próximo
+    window_df = window_df.sort_values('dt_local').drop_duplicates(subset=['home','away'], keep='first')
+
+    if window_df.empty:
+        send_telegram(token, chat_id, f"*{title}*: No hay partidos en la ventana {start.date()}–{(end - pd.Timedelta(seconds=1)).date()} ({tz}).")
+        return
+
+    # 4) Features base (Elo + RPD)
+    feats_df = build_features_current(window_df, elo_now, rpd_now)
+
+    # 5) Margen base y spread del model (home)
+    margin_pred_base = ridge.predict(feats_df[feats])
+    model_spread_home_base = -margin_pred_base  # negativo: local favorito
+
+    # 6) Lesiones -> puntos por equipo -> ajuste al margen
+    team_codes = {TEAM_MAP.get(t) for t in pd.concat([feats_df['home'], feats_df['away']]).unique() if TEAM_MAP.get(t)}
+    injuries = get_injuries_optional(sdio_k, team_codes) if len(team_codes) > 0 else {}
+    home_pts, away_pts = [], []
+    for _, r in feats_df[['home', 'away']].iterrows():
+        h, a = TEAM_MAP.get(r['home']), TEAM_MAP.get(r['away'])
+        ih = injuries.get(h, {'qb': 'N/D', 'outs': 'N/D'})
+        ia = injuries.get(a, {'qb': 'N/D', 'outs': 'N/D'})
+        home_pts.append(injury_points(ih['qb'], ih['outs']))
+        away_pts.append(injury_points(ia['qb'], ia['outs']))
+
+    feats_df['home_inj_pts'] = home_pts
+    feats_df['away_inj_pts'] = away_pts
+    feats_df['inj_diff_pts'] = feats_df['home_inj_pts'] - feats_df['away_inj_pts']  # >0 => local más golpeado
+
+    # 7) Margen y model spread ajustados por lesiones
+    margin_pred_adj = margin_pred_base - feats_df['inj_diff_pts']
+    model_spread_home_adj = -margin_pred_adj
+
+    # 8) Empaquetar y decidir pick
+    out = feats_df.copy()
+    out['market_spread_home']     = window_df['market_spread_home'].values
+    out['margin_pred_adj']        = margin_pred_adj
+    out['model_spread_home_adj']  = model_spread_home_adj
+
+    out = decide_picks(out)  # sin umbral: TODOS los juegos
+
+    # 9) Armar mensajes (Top-N detallados + menciones rápidas) y enviar
+    msgs = compose_messages(title, out, injuries, chunk_limit=3500)
+    for m in msgs:
+        send_telegram(token, chat_id, m, parse_mode="Markdown")
+
+# --------------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------------
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--batch", choices=["tnf", "weekend"], required=True)
+    args = p.parse_args()
+    main(args.batch)
