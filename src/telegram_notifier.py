@@ -5,6 +5,8 @@ import numpy as np
 import yaml
 from sklearn.linear_model import Ridge
 from pathlib import Path
+# opcional: para dormir entre mensajes si quieres (no es necesario)
+# import time
 
 from elo import update_elo
 from features import rolling_point_diff
@@ -240,24 +242,26 @@ def decide_picks(df, edge_pts=None):
     return out
 
 # --------------------------------------------------------------------------------------
-# MENSAJE PARA TELEGRAM (TODOS LOS JUEGOS, ORDENADOS POR CONFIANZA)
+# MENSAJES: PARTIMOS EN CHUNKS PARA NO EXCEDER 4096 CARACTERES
 # --------------------------------------------------------------------------------------
-def compose_message(title: str, picks_df: pd.DataFrame, injuries: dict) -> str:
+def compose_messages(title: str, picks_df: pd.DataFrame, injuries: dict, chunk_limit: int = 3500) -> list:
     """
-    Ordena TODOS los picks por 'confidence' desc y muestra:
-    Market, Model (ajustado), Edge, Ajuste lesiones, Pick, Confianza%, Prob. cubrir%, y lesiones.
+    Devuelve una lista de mensajes (strings) ya cortados por longitud.
+    Ordena TODOS los picks por 'confidence' desc y arma bloques por juego.
     """
-    lines = [f"*{title}*"]
+    header = f"*{title}*"
     if picks_df.empty:
-        lines.append("_No hay partidos disponibles._")
-        return "\n".join(lines)
+        return [header + "\n_No hay partidos disponibles._"]
 
     df = picks_df.sort_values('confidence', ascending=False).reset_index(drop=True)
 
+    # Construir bloques por juego
+    blocks = []
     for _, r in df.iterrows():
         conf_pct = int(round(100 * float(r['confidence'])))
         p_cover_pct = int(round(100 * float(r['p_cover_pick'])))
 
+        lines = []
         lines.append(f"{r['away']} @ {r['home']}")
         lines.append(f"Market (home): {r['market_spread_home']:+.1f} | Model: {r['model_spread_home_adj']:+.1f} | Edge: {r['edge_pts']:+.1f}")
         lines.append(f"Ajuste lesiones (home-away): {r['inj_diff_pts']:+.1f} pts")
@@ -271,8 +275,44 @@ def compose_message(title: str, picks_df: pd.DataFrame, injuries: dict) -> str:
             lines.append("Lesiones: N/D")
 
         lines.append("— Motivos: Elo y forma (RPD) + ajuste por lesiones.\n")
+        blocks.append("\n".join(lines))
 
-    return "\n".join(lines).strip()
+    # Armar mensajes acumulando bloques sin pasar el límite
+    messages = []
+    current = header
+    for b in blocks:
+        candidate = current + ("\n" if current else "") + b
+        if len(candidate) > chunk_limit:
+            messages.append(current)
+            current = header + " (cont.)\n" + b  # nuevo chunk
+        else:
+            current = candidate
+    if current:
+        messages.append(current)
+
+    # (Opcional) etiquetar partes
+    if len(messages) > 1:
+        total = len(messages)
+        messages = [f"{m}\n_Parte {i}/{total}_" for i, m in enumerate(messages, 1)]
+
+    return messages
+
+# --------------------------------------------------------------------------------------
+# Envío a Telegram con logs
+# --------------------------------------------------------------------------------------
+def send_telegram(token: str, chat_id: str, text: str, parse_mode: str = "Markdown"):
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True}
+    r = requests.post(url, data=data, timeout=30)
+    # Log para GitHub Actions
+    try:
+        js = r.json()
+    except Exception:
+        js = {"raw": r.text}
+    print(f"[telegram] status={r.status_code} ok={js.get('ok')} desc={js.get('description')}")
+    r.raise_for_status()
+    if not js.get('ok', False):
+        raise RuntimeError(f"Telegram error: {js}")
 
 # --------------------------------------------------------------------------------------
 # Main
@@ -292,8 +332,7 @@ def main(batch: str):
     # 2) Lee odds actuales
     odds = get_odds(odds_k)
     if odds.empty:
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                      data={"chat_id": chat_id, "text": "*NFL Picks*: no hay odds disponibles ahora mismo.", "parse_mode": "Markdown"})
+        send_telegram(token, chat_id, "*NFL Picks*: no hay odds disponibles ahora mismo.")
         return
 
     # 3) Filtra por TNF o Weekend (jueves=3, viernes=4, sábado=5, domingo=6, lunes=0)
@@ -307,8 +346,7 @@ def main(batch: str):
         title = "Weekend (ATS)"
 
     if df.empty:
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                      data={"chat_id": chat_id, "text": f"*{title}*: No hay partidos en ventana esperada.", "parse_mode": "Markdown"})
+        send_telegram(token, chat_id, f"*{title}*: No hay partidos en ventana esperada.")
         return
 
     # 4) Features base (Elo + RPD)
@@ -343,12 +381,13 @@ def main(batch: str):
     out['margin_pred_adj']        = margin_pred_adj
     out['model_spread_home_adj']  = model_spread_home_adj
 
-    out = decide_picks(out)  # ahora sin umbral
+    out = decide_picks(out)  # sin umbral: TODOS los juegos
 
-    # 9) Armar mensaje y enviar
-    msg = compose_message(title, out, injuries)
-    requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                  data={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": True})
+    # 9) Armar mensajes (chunking) y enviar
+    msgs = compose_messages(title, out, injuries, chunk_limit=3500)
+    for i, m in enumerate(msgs, 1):
+        send_telegram(token, chat_id, m, parse_mode="Markdown")
+        # time.sleep(0.5)  # opcional
 
 # --------------------------------------------------------------------------------------
 # CLI
