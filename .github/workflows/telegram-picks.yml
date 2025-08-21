@@ -1,9 +1,20 @@
 name: NFL Picks to Telegram
 
+permissions:
+  contents: read
+
+concurrency:
+  group: telegram-picks-${{ github.ref }}
+  cancel-in-progress: false
+
 on:
   schedule:
-    - cron: "0 16 * * 4"   # Jueves 09:00 Tijuana (TNF)
-    - cron: "0 22 * * 5"   # Viernes 15:00 Tijuana (Weekend)
+    # TNF: 09:03 y 09:08 Tijuana aprox (16:03/16:08 UTC cuando Tijuana = UTC-7)
+    - cron: "3 16 * * 4"
+    - cron: "8 16 * * 4"
+    # WEEKEND: 15:05 y 15:10 Tijuana aprox (22:05/22:10 UTC cuando Tijuana = UTC-7)
+    - cron: "5 22 * * 5"
+    - cron: "10 22 * * 5"
   workflow_dispatch:
     inputs:
       batch:
@@ -16,8 +27,11 @@ on:
 jobs:
   picks:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -31,11 +45,16 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "BATCH=${{ inputs.batch }}" >> $GITHUB_ENV
-          elif [ "${{ github.event.schedule }}" = "0 16 * * 4" ]; then
-            echo "BATCH=tnf" >> $GITHUB_ENV
           else
-            echo "BATCH=weekend" >> $GITHUB_ENV
+            # Decide por día local (America/Tijuana)
+            DOW=$(TZ=America/Tijuana date +%u)   # 1=lun ... 7=dom
+            if [ "$DOW" -eq 4 ]; then
+              echo "BATCH=tnf" >> $GITHUB_ENV
+            else
+              echo "BATCH=weekend" >> $GITHUB_ENV
+            fi
           fi
+          echo "Fecha local: $(TZ=America/Tijuana date -Iseconds)"
 
       - name: Run notifier
         env:
