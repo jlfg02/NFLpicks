@@ -6,7 +6,7 @@ permissions:
 on:
   workflow_dispatch: {}
   schedule:
-    # Lunes ~09:10 y ~13:10 Tijuana (cron en UTC). Tener ambas no molesta.
+    # Lunes ~09:10 y ~13:10 Tijuana (cron en UTC)
     - cron: "10 16 * * 1"
     - cron: "10 20 * * 1"
 
@@ -26,6 +26,24 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Debug env & repo layout
+        env:
+          SPORTSDATAIO_KEY: ${{ secrets.SPORTSDATAIO_KEY }}
+        run: |
+          echo "Branch: $GITHUB_REF"
+          echo "Now (UTC): $(date -Iseconds)"
+          echo "Repo tree:"
+          ls -la
+          echo "src/:"
+          ls -la src || true
+          echo "data/:"
+          ls -la data || true
+          if [ -z "$SPORTSDATAIO_KEY" ]; then
+            echo "ERROR: SPORTSDATAIO_KEY is empty (secret missing or not granted)"; exit 1
+          else
+            echo "SPORTSDATAIO_KEY length: ${#SPORTSDATAIO_KEY}"
+          fi
 
       - name: Run updater
         env:
