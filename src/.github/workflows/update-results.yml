@@ -4,11 +4,11 @@ permissions:
   contents: write
 
 on:
+  workflow_dispatch: {}
   schedule:
-    # Lunes ~09:10 y ~13:10 hora Tijuana (cron se evalúa en UTC)
+    # Lunes ~09:10 y ~13:10 Tijuana (cron en UTC). Tener ambas no molesta.
     - cron: "10 16 * * 1"
     - cron: "10 20 * * 1"
-  workflow_dispatch: {}
 
 jobs:
   update:
