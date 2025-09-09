@@ -1,0 +1,45 @@
+name: Update NFL results (historical_games.csv)
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Lunes ~09:10 y ~13:10 Tijuana (cron en UTC). Tener ambas no molesta.
+    - cron: "10 16 * * 1"
+    - cron: "10 20 * * 1"
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run updater
+        env:
+          SPORTSDATAIO_KEY: ${{ secrets.SPORTSDATAIO_KEY }}
+        run: |
+          python src/update_results.py
+
+      - name: Commit & push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet --exit-code data/historical_games.csv; then
+            git add data/historical_games.csv
+            git commit -m "chore(data): auto-update historical_games.csv"
+            git push
+          else
+            echo "No hay cambios que commitear."
