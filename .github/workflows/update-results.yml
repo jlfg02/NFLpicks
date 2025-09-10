@@ -17,6 +17,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # por si hay que pushear sin FF
 
       - uses: actions/setup-python@v5
         with:
@@ -33,14 +35,11 @@ jobs:
         run: |
           echo "Branch: $GITHUB_REF"
           echo "Now (UTC): $(date -Iseconds)"
-          echo "Repo tree:"
-          ls -la
-          echo "src/:"
-          ls -la src || true
-          echo "data/:"
-          ls -la data || true
+          echo "Repo tree:"; ls -la
+          echo "src/:"; ls -la src || true
+          echo "data/:"; ls -la data || true
           if [ -z "$SPORTSDATAIO_KEY" ]; then
-            echo "ERROR: SPORTSDATAIO_KEY is empty (secret missing or not granted)"; exit 1
+            echo "WARN: SPORTSDATAIO_KEY is empty (secret missing or not granted)"
           else
             echo "SPORTSDATAIO_KEY length: ${#SPORTSDATAIO_KEY}"
           fi
@@ -55,9 +54,14 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git status --porcelain
           if ! git diff --quiet --exit-code data/historical_games.csv; then
+            echo "Hay cambios en data/historical_games.csv. Commiteando..."
             git add data/historical_games.csv
             git commit -m "chore(data): auto-update historical_games.csv"
+            # por si alguien empujó a main entre checkout y push
+            git pull --rebase
             git push
           else
             echo "No hay cambios que commitear."
+          fi
