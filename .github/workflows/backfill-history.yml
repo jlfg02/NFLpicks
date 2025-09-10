@@ -33,11 +33,16 @@ jobs:
 
       - name: Commit & push if changed
         run: |
+          set -e
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git status --porcelain
           if ! git diff --quiet --exit-code data/historical_games.csv; then
+            echo "Hay cambios en data/historical_games.csv. Commiteando..."
             git add data/historical_games.csv
             git commit -m "feat(data): backfill 2022-2024 NFL finals"
+            git pull --rebase
             git push
           else
             echo "No hay cambios"
+          fi
