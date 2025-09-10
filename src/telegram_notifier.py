@@ -1,87 +1,452 @@
-Weekend (ATS)
-Buffalo Bills @ New York Jets
-Market (home): +7.0 | Model: -5.0 | Edge: -12.0
-Ajuste lesiones (home-away): +0.0 pts
-Pick: HOME | Confianza: 95% | Prob. cubrir: 95%
-Lesiones: BUF QB healthy, outs 0 vs NYJ QB healthy, outs 0
-— Motivos: Elo y forma (RPD) + ajuste por lesiones.
+import os
+import requests
+import pandas as pd
+import numpy as np
+import yaml
+from sklearn.linear_model import Ridge
+from pathlib import Path
 
-Los Angeles Rams @ Tennessee Titans
-Market (home): +5.5 | Model: -5.0 | Edge: -10.5
-Ajuste lesiones (home-away): +0.0 pts
-Pick: HOME | Confianza: 93% | Prob. cubrir: 93%
-Lesiones: LA QB healthy, outs 0 vs TEN QB healthy, outs 0
-— Motivos: Elo y forma (RPD) + ajuste por lesiones.
+from elo import update_elo
+from features import rolling_point_diff
 
-San Francisco 49ers @ New Orleans Saints
-Market (home): +4.5 | Model: -5.0 | Edge: -9.5
-Ajuste lesiones (home-away): +0.0 pts
-Pick: HOME | Confianza: 92% | Prob. cubrir: 92%
-Lesiones: SF QB healthy, outs 0 vs NO QB healthy, outs 0
-— Motivos: Elo y forma (RPD) + ajuste por lesiones.
+# --------------------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------------------
+CFG = yaml.safe_load(open(Path(__file__).resolve().parents[1] / 'config.yaml'))
 
-Los Angeles Chargers @ Las Vegas Raiders
-Market (home): +3.5 | Model: -5.0 | Edge: -8.5
-Ajuste lesiones (home-away): +0.0 pts
-Pick: HOME | Confianza: 89% | Prob. cubrir: 89%
-Lesiones: LAC QB healthy, outs 0 vs LV QB healthy, outs 0
-— Motivos: Elo y forma (RPD) + ajuste por lesiones.
+# Mapeo nombres The Odds API -> códigos SportsDataIO (y nuestro histórico)
+TEAM_MAP = {
+    "Arizona Cardinals": "ARI", "Atlanta Falcons": "ATL", "Baltimore Ravens": "BAL", "Buffalo Bills": "BUF",
+    "Carolina Panthers": "CAR", "Chicago Bears": "CHI", "Cincinnati Bengals": "CIN", "Cleveland Browns": "CLE",
+    "Dallas Cowboys": "DAL", "Denver Broncos": "DEN", "Detroit Lions": "DET", "Green Bay Packers": "GB",
+    "Houston Texans": "HOU", "Indianapolis Colts": "IND", "Jacksonville Jaguars": "JAX", "Kansas City Chiefs": "KC",
+    "Las Vegas Raiders": "LV", "Los Angeles Chargers": "LAC", "Los Angeles Rams": "LA", "Miami Dolphins": "MIA",
+    "Minnesota Vikings": "MIN", "New England Patriots": "NE", "New Orleans Saints": "NO", "New York Giants": "NYG",
+    "New York Jets": "NYJ", "Philadelphia Eagles": "PHI", "Pittsburgh Steelers": "PIT", "San Francisco 49ers": "SF",
+    "Seattle Seahawks": "SEA", "Tampa Bay Buccaneers": "TB", "Tennessee Titans": "TEN", "Washington Commanders": "WAS"
+}
 
-Denver Broncos @ Indianapolis Colts
-Market (home): +2.5 | Model: -5.0 | Edge: -7.5
-Ajuste lesiones (home-away): +0.0 pts
-Pick: HOME | Confianza: 87% | Prob. cubrir: 87%
-Lesiones: DEN QB healthy, outs 0 vs IND QB healthy, outs 0
-— Motivos: Elo y forma (RPD) + ajuste por lesiones.
+# --------------------------------------------------------------------------------------
+# Datos
+# --------------------------------------------------------------------------------------
+def load_hist():
+    """
+    Carga históricos para entrenar el ridge que estima el margen (home).
+    Si no hay archivo, usa una pequeña semilla para que el pipeline no falle.
+    """
+    p = Path(__file__).resolve().parents[1] / 'data' / 'historical_games.csv'
+    if p.exists():
+        return pd.read_csv(p)
 
-Philadelphia Eagles @ Kansas City Chiefs
-Market (home): +1.5 | Model: -5.0 | Edge: -6.5
-Ajuste lesiones (home-away): +0.0 pts
-Pick: HOME | Confianza: 84% | Prob. cubrir: 84%
-Lesiones: PHI QB healthy, outs 0 vs KC QB healthy, outs 0
-— Motivos: Elo y forma (RPD) + ajuste por lesiones.
+    return pd.DataFrame([
+        {'season': 2024, 'week': 1, 'home': 'KC',  'away': 'DET', 'home_score': 20, 'away_score': 21, 'closing_spread_home': -6.5, 'game_date':'2024-09-07'},
+        {'season': 2024, 'week': 1, 'home': 'NYJ', 'away': 'BUF', 'home_score': 22, 'away_score': 16, 'closing_spread_home':  2.5, 'game_date':'2024-09-08'},
+        {'season': 2024, 'week': 2, 'home': 'KC',  'away': 'CIN', 'home_score': 27, 'away_score': 20, 'closing_spread_home': -3.0, 'game_date':'2024-09-14'},
+        {'season': 2024, 'week': 2, 'home': 'DAL', 'away': 'WAS', 'home_score': 24, 'away_score': 17, 'closing_spread_home': -4.0, 'game_date':'2024-09-15'},
+    ])
 
-Cleveland Browns @ Baltimore Ravens
-Market (home): -11.5 | Model: -5.0 | Edge: +6.5
-Ajuste lesiones (home-away): +0.0 pts
-Pick: AWAY | Confianza: 84% | Prob. cubrir: 84%
-Lesiones: CLE QB healthy, outs 0 vs BAL QB healthy, outs 0
-— Motivos: Elo y forma (RPD) + ajuste por lesiones.
+# --------------------------------------------------------------------------------------
+# Modelo: entrenamiento (Ridge para margen del local con Elo + RPD)
+# --------------------------------------------------------------------------------------
+def train_ridge(hist: pd.DataFrame):
+    """
+    Entrena un modelo ridge simple para predecir el margen del local:
+      margin_pred ≈ β0 + β1*elo_diff + β2*rpd_diff (+ intercepto via home_flag)
+    """
+    teams = pd.Index(hist['home']).append(pd.Index(hist['away'])).unique()
+    elo = {t: 1500.0 for t in teams}
 
-New England Patriots @ Miami Dolphins
-Market (home): -1.5 | Model: -5.0 | Edge: -3.5
-Ajuste lesiones (home-away): +0.0 pts
-Pick: HOME | Confianza: 71% | Prob. cubrir: 71%
-Lesiones: NE QB healthy, outs 0 vs MIA QB healthy, outs 0
-— Motivos: Elo y forma (RPD) + ajuste por lesiones.
+    # Snapshot de Elo pre-partido y luego actualización
+    records = []
+    for (season, week), gdf in hist.sort_values(['season', 'week']).groupby(['season', 'week']):
+        for _, g in gdf.iterrows():
+            records.append({
+                'season': season, 'week': week, 'home': g['home'], 'away': g['away'],
+                'home_elo': elo.get(g['home'], 1500.0), 'away_elo': elo.get(g['away'], 1500.0)
+            })
+        for _, g in gdf.iterrows():
+            elo = update_elo(elo, g['home'], g['away'], g['home_score'], g['away_score'])
 
-Tampa Bay Buccaneers @ Houston Texans
-Market (home): -2.5 | Model: -5.0 | Edge: -2.5
-Ajuste lesiones (home-away): +0.0 pts
-Pick: HOME | Confianza: 65% | Prob. cubrir: 65%
-Lesiones: TB QB healthy, outs 0 vs HOU QB healthy, outs 0
-— Motivos: Elo y forma (RPD) + ajuste por lesiones.
+    pre = pd.DataFrame(records)
+    X = hist.merge(pre, on=['season', 'week', 'home', 'away'], how='left').copy()
+    X['elo_diff'] = X['home_elo'] - X['away_elo']
+    X['margin']   = X['home_score'] - X['away_score']
 
-Seattle Seahawks @ Pittsburgh Steelers
-Market (home): -3.0 | Model: -5.0 | Edge: -2.0
-Ajuste lesiones (home-away): +0.0 pts
-Pick: HOME | Confianza: 62% | Prob. cubrir: 62%
-Lesiones: SEA QB healthy, outs 0 vs PIT QB healthy, outs 0
-— Motivos: Elo y forma (RPD) + ajuste por lesiones.
+    # Forma reciente (rolling point differential) por código de equipo
+    rpd = rolling_point_diff(hist)  # columnas: team (cód), rpd
+    X = X.merge(rpd.rename(columns={'team': 'home', 'rpd': 'home_rpd'}), on='home', how='left')
+    X = X.merge(rpd.rename(columns={'team': 'away', 'rpd': 'away_rpd'}), on='away', how='left')
+    X['rpd_diff']  = X['home_rpd'].fillna(0.0) - X['away_rpd'].fillna(0.0)
+    X['home_flag'] = 1  # intercepto
 
-Jacksonville Jaguars @ Cincinnati Bengals
-Market (home): -3.5 | Model: -5.0 | Edge: -1.5
-Ajuste lesiones (home-away): +0.0 pts
-Pick: HOME | Confianza: 59% | Prob. cubrir: 59%
-Lesiones: JAX QB healthy, outs 0 vs CIN QB healthy, outs 0
-— Motivos: Elo y forma (RPD) + ajuste por lesiones.
+    feats = ['elo_diff', 'rpd_diff', 'home_flag']
+    ridge = Ridge(alpha=1.0).fit(X[feats], X['margin'])
+    return ridge, feats, rpd, elo
 
-Carolina Panthers @ Arizona Cardinals
-Market (home): -6.5 | Model: -5.0 | Edge: +1.5
-Ajuste lesiones (home-away): +0.0 pts
-Pick: AWAY | Confianza: 59% | Prob. cubrir: 59%
-Lesiones: CAR QB healthy, outs 0 vs ARI QB healthy, outs 0
-— Motivos: Elo y forma (RPD) + ajuste por lesiones.
+# --------------------------------------------------------------------------------------
+# Odds del mercado (The Odds API)
+# --------------------------------------------------------------------------------------
+def get_odds(odds_api_key: str) -> pd.DataFrame:
+    """
+    Obtiene spreads pre-partido de The Odds API y devuelve:
+    ['home','away','market_spread_home','commence_time']
+    (home/away son NOMBRES LARGOS de equipo, no códigos)
+    """
+    url = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds/"
+    params = {"regions": "us", "markets": "spreads", "oddsFormat": "american", "apiKey": odds_api_key}
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    games = r.json()
 
-— Resto (menciones rápidas) —
-Parte 1/2
+    rows = []
+    for g in games:
+        home, away = g.get('home_team'), g.get('away_team')
+        spread_home = None
+        if 'bookmakers' in g and g['bookmakers']:
+            prefer = ['DraftKings', 'Pinnacle', 'Caesars', 'FanDuel', 'BetMGM']
+            sel = next((b for name in prefer for b in g['bookmakers'] if b.get('title') == name), g['bookmakers'][0])
+            for mk in sel.get('markets', []):
+                if mk.get('key') == 'spreads':
+                    for o in mk.get('outcomes', []):
+                        if o.get('name') == home:
+                            try:
+                                spread_home = float(o.get('point'))
+                            except Exception:
+                                spread_home = None
+                            break
+        if spread_home is None:
+            continue
+
+        rows.append({
+            'home': home,                       # nombre largo
+            'away': away,                       # nombre largo
+            'market_spread_home': spread_home,
+            'commence_time': g.get('commence_time')
+        })
+    return pd.DataFrame(rows)
+
+# --------------------------------------------------------------------------------------
+# Lesiones (SportsDataIO) — opcional
+# --------------------------------------------------------------------------------------
+def get_injuries_optional(sdi_key: str, team_codes: set) -> dict:
+    """
+    Devuelve dict {code: {'qb': 'healthy|questionable|out'|'N/D', 'outs': N|'N/D'}}.
+    Usa projections/json/InjuredPlayers de SportsDataIO.
+    Si no hay key, devuelve N/D (sin afectar el model).
+    """
+    if not sdi_key or not team_codes:
+        return {t: {'qb': 'N/D', 'outs': 'N/D'} for t in team_codes}
+
+    url = "https://api.sportsdata.io/v3/nfl/projections/json/InjuredPlayers"
+    headers = {"Ocp-Apim-Subscription-Key": sdi_key}
+
+    try:
+        r = requests.get(url, headers=headers, timeout=30)
+        r.raise_for_status()
+        players = r.json()
+    except Exception:
+        return {t: {'qb': 'N/D', 'outs': 'N/D'} for t in team_codes}
+
+    out = {t: {'qb': 'healthy', 'outs': 0} for t in team_codes}
+    for p in players:
+        team = (p.get('Team') or '').upper()
+        if team not in out:
+            continue
+        status = (p.get('InjuryStatus') or '').lower()
+        pos = (p.get('Position') or '').upper()
+
+        # Conteo de titulares OUT/DOUBTFUL
+        if 'out' in status or 'doubtful' in status:
+            out[team]['outs'] += 1
+
+        # Estado del QB
+        if pos == 'QB':
+            if 'out' in status or 'doubtful' in status:
+                out[team]['qb'] = 'out'
+            elif 'questionable' in status or 'probable' in status:
+                if out[team]['qb'] != 'out':
+                    out[team]['qb'] = 'questionable'
+    return out
+
+def injury_points(qb_status: str, outs) -> float:
+    """
+    Convierte el resumen de lesiones a puntos (penalización) para el equipo.
+    Lee de config o usa defaults:
+      QB_OUT_PTS (3.0), QB_Q_PTS (1.0), STARTER_OUT_PTS (0.3), INJURY_CAP_PTS (5.0)
+    """
+    q_out  = float(CFG.get('QB_OUT_PTS', 3.0))
+    q_q    = float(CFG.get('QB_Q_PTS', 1.0))
+    per_o  = float(CFG.get('STARTER_OUT_PTS', 0.3))
+    cap    = float(CFG.get('INJURY_CAP_PTS', 5.0))
+
+    qb = 0.0
+    s = (qb_status or '').lower()
+    if s == 'out':
+        qb = q_out
+    elif s == 'questionable':
+        qb = q_q
+
+    try:
+        n_outs = float(outs)
+    except Exception:
+        n_outs = 0.0
+
+    total = qb + per_o * n_outs
+    return float(min(total, cap))
+
+# --------------------------------------------------------------------------------------
+# Features actuales (AHORA con códigos de equipo)
+# --------------------------------------------------------------------------------------
+def build_features_current(odds_df: pd.DataFrame, elo_now: dict, rpd_now: pd.DataFrame) -> pd.DataFrame:
+    """
+    odds_df debe traer columnas:
+      home, away (nombres largos para mostrar)
+      home_code, away_code (códigos para modelar)
+    """
+    df = odds_df.copy()
+
+    # Elo por código
+    df['home_elo'] = df['home_code'].map(elo_now).fillna(1500.0)
+    df['away_elo'] = df['away_code'].map(elo_now).fillna(1500.0)
+    df['elo_diff'] = df['home_elo'] - df['away_elo']
+
+    # RPD por código
+    r_home = rpd_now.rename(columns={'team': 'home_code', 'rpd': 'home_rpd'})
+    r_away = rpd_now.rename(columns={'team': 'away_code', 'rpd': 'away_rpd'})
+    df = df.merge(r_home, on='home_code', how='left').merge(r_away, on='away_code', how='left')
+    df['rpd_diff'] = df['home_rpd'].fillna(0.0) - df['away_rpd'].fillna(0.0)
+
+    # Intercepto
+    df['home_flag'] = 1
+    return df
+
+# --------------------------------------------------------------------------------------
+# DECISIÓN DE PICKS (SIN UMBRAL, POR PROBABILIDAD)
+# --------------------------------------------------------------------------------------
+def decide_picks(df, edge_pts=None):
+    """
+    Decide pick por probabilidad de cubrir (sin umbral).
+    - p_home_cover = σ(alpha * (margin_pred_adj + market_spread_home))
+    - pick_side = HOME si p_home_cover >= 0.5, si no AWAY
+    - confidence = probabilidad del lado elegido (0.50–1.00)
+    """
+    alpha = float(CFG.get('PROB_ALPHA', 0.25))
+    out = df.copy()
+
+    # edge (referencia visual): model - market (perspectiva home)
+    out['edge_pts'] = out['model_spread_home_adj'] - out['market_spread_home']
+
+    # prob de que el LOCAL cubra su spread del mercado
+    z = out['margin_pred_adj'] + out['market_spread_home']
+    p_home_cover = 1.0 / (1.0 + np.exp(-alpha * z))
+    out['p_home_cover'] = p_home_cover
+
+    # pick por probabilidad (sin umbral)
+    out['pick_side'] = np.where(out['p_home_cover'] >= 0.5, 'HOME', 'AWAY')
+    out['p_cover_pick'] = np.where(out['pick_side'].eq('HOME'), out['p_home_cover'], 1 - out['p_home_cover'])
+
+    # confianza = prob del lado elegido (0.50..1.00)
+    out['confidence'] = out['p_cover_pick']
+
+    return out
+
+# --------------------------------------------------------------------------------------
+# MENSAJES: TOP-N DETALLADOS + RESTO EN "MENCIONES RÁPIDAS" + SPLIT
+# --------------------------------------------------------------------------------------
+def compose_messages(title: str, picks_df: pd.DataFrame, injuries: dict, chunk_limit: int = 3500) -> list:
+    header = f"*{title}*"
+    if picks_df.empty:
+        return [header + "\n_No hay partidos disponibles._"]
+
+    df = picks_df.sort_values('confidence', ascending=False).reset_index(drop=True)
+    top_n = int(CFG.get("MAX_PICKS_DETAIL", 12))
+    detailed = df.head(top_n)
+    quick = df.iloc[top_n:]
+
+    # Construir bloques detallados
+    detail_blocks = []
+    for _, r in detailed.iterrows():
+        conf_pct = int(round(100 * float(r['confidence'])))
+        p_cover_pct = int(round(100 * float(r['p_cover_pick'])))
+
+        lines = []
+        lines.append(f"{r['away']} @ {r['home']}")
+        lines.append(f"Market (home): {r['market_spread_home']:+.1f} | Model: {r['model_spread_home_adj']:+.1f} | Edge: {r['edge_pts']:+.1f}")
+        lines.append(f"Ajuste lesiones (home-away): {r['inj_diff_pts']:+.1f} pts")
+        lines.append(f"Pick: *{r['pick_side']}* | Confianza: {conf_pct}% | Prob. cubrir: {p_cover_pct}%")
+
+        # Preferimos los códigos si vienen en el DF
+        h_code = r.get('home_code', None)
+        a_code = r.get('away_code', None)
+        if not h_code or not a_code:
+            h_code = TEAM_MAP.get(r['home'])
+            a_code = TEAM_MAP.get(r['away'])
+
+        if injuries and h_code in injuries and a_code in injuries:
+            ih, ia = injuries[h_code], injuries[a_code]
+            lines.append(f"Lesiones: {a_code} QB {ia['qb']}, outs {ia['outs']} vs {h_code} QB {ih['qb']}, outs {ih['outs']}")
+        else:
+            lines.append("Lesiones: N/D")
+
+        lines.append("— Motivos: Elo y forma (RPD) + ajuste por lesiones.\n")
+        detail_blocks.append("\n".join(lines))
+
+    # Construir sección de menciones rápidas
+    quick_blocks = []
+    if not quick.empty:
+        quick_blocks.append("— *Resto (menciones rápidas)* —")
+        for _, r in quick.iterrows():
+            conf_pct = int(round(100 * float(r['confidence'])))
+            edge = f"{float(r['edge_pts']):+0.1f}"
+            injd = f"{float(r['inj_diff_pts']):+0.1f}"
+            quick_blocks.append(f"• {r['away']} @ {r['home']}: *{r['pick_side']}*, Conf {conf_pct}%, Edge {edge}, InjΔ {injd}")
+
+    # Empaquetar
+    messages = []
+    current = header
+    def try_add(block: str):
+        nonlocal current, messages
+        candidate = current + ("\n" if current else "") + block
+        if len(candidate) > chunk_limit:
+            messages.append(current)
+            current = header + " (cont.)\n" + block
+        else:
+            current = candidate
+
+    for b in detail_blocks:
+        try_add(b)
+    for b in quick_blocks:
+        try_add(b)
+
+    if current:
+        messages.append(current)
+
+    if len(messages) > 1:
+        total = len(messages)
+        messages = [f"{m}\n_Parte {i}/{total}_" for i, m in enumerate(messages, 1)]
+
+    return messages
+
+# --------------------------------------------------------------------------------------
+# Envío a Telegram con logs
+# --------------------------------------------------------------------------------------
+def send_telegram(token: str, chat_id: str, text: str, parse_mode: str = "Markdown"):
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True}
+    r = requests.post(url, data=data, timeout=30)
+    try:
+        js = r.json()
+    except Exception:
+        js = {"raw": r.text}
+    print(f"[telegram] status={r.status_code} ok={js.get('ok')} desc={js.get('description')}")
+    r.raise_for_status()
+    if not js.get('ok', False):
+        raise RuntimeError(f"Telegram error: {js}")
+
+# --------------------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------------------
+def main(batch: str):
+    token   = os.environ.get('TELEGRAM_BOT_TOKEN')
+    chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+    odds_k  = os.environ.get('ODDS_API_KEY')
+    sdio_k  = os.environ.get('SPORTSDATAIO_KEY', '')  # opcional
+
+    assert token and chat_id and odds_k, "Faltan TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID u ODDS_API_KEY"
+
+    # 1) Entrena modelo de margen con históricos
+    hist = load_hist()
+    ridge, feats, rpd_now, elo_now = train_ridge(hist)
+    print(f"[train] rows_hist={len(hist)} teams_elo={len(elo_now)} feats={feats}")
+
+    # 2) Lee odds actuales
+    odds = get_odds(odds_k)
+    if odds.empty:
+        send_telegram(token, chat_id, "*NFL Picks*: no hay odds disponibles ahora mismo.")
+        return
+
+    # 3) Ventana temporal por huso horario (America/Tijuana)
+    tz = CFG.get("TIMEZONE", "America/Tijuana")
+    odds['dt_utc'] = pd.to_datetime(odds['commence_time'], utc=True, errors='coerce')
+    odds['dt_local'] = odds['dt_utc'].dt.tz_convert(tz)
+
+    now_local = pd.Timestamp.now(tz=tz)
+    if batch == 'tnf':
+        days_to_thu = (3 - now_local.weekday()) % 7
+        thu = (now_local + pd.Timedelta(days=days_to_thu)).normalize()
+        start = thu
+        end = thu + pd.Timedelta(days=1)
+        title = "TNF (ATS)"
+        window_df = odds[(odds['dt_local'] >= start) & (odds['dt_local'] < end)].copy()
+    else:
+        days_to_fri = (4 - now_local.weekday()) % 7
+        fri = (now_local + pd.Timedelta(days=days_to_fri)).normalize()
+        mon = fri + pd.Timedelta(days=3)
+        start = fri
+        end = mon + pd.Timedelta(days=1)
+        title = "Weekend (ATS)"
+        window_df = odds[(odds['dt_local'] >= start) & (odds['dt_local'] < end)].copy()
+
+    # quita duplicados y mapea CÓDIGOS para modelar
+    window_df = window_df.sort_values('dt_local').drop_duplicates(subset=['home','away'], keep='first')
+    window_df['home_code'] = window_df['home'].map(TEAM_MAP)
+    window_df['away_code'] = window_df['away'].map(TEAM_MAP)
+    # descarta juegos sin código (por seguridad)
+    before_len = len(window_df)
+    window_df = window_df[window_df['home_code'].notna() & window_df['away_code'].notna()].copy()
+    if len(window_df) < before_len:
+        print(f"[warn] descartar juegos sin código: {before_len - len(window_df)}")
+
+    if window_df.empty:
+        send_telegram(token, chat_id, f"*{title}*: No hay partidos en la ventana {start.date()}–{(end - pd.Timedelta(seconds=1)).date()} ({tz}).")
+        return
+
+    # 4) Features base (Elo + RPD) **usando códigos**
+    feats_df = build_features_current(window_df, elo_now, rpd_now)
+
+    # 5) Margen base y spread del model (home)
+    margin_pred_base = ridge.predict(feats_df[['elo_diff','rpd_diff','home_flag']])
+    model_spread_home_base = -margin_pred_base  # negativo: local favorito
+
+    # 6) Lesiones -> puntos por equipo -> ajuste al margen (por CÓDIGO)
+    team_codes = set(pd.concat([feats_df['home_code'], feats_df['away_code']]).dropna().unique())
+    injuries = get_injuries_optional(sdio_k, team_codes) if len(team_codes) > 0 else {}
+    home_pts, away_pts = [], []
+    for _, r in feats_df[['home_code', 'away_code']].iterrows():
+        ih = injuries.get(r['home_code'], {'qb': 'N/D', 'outs': 'N/D'})
+        ia = injuries.get(r['away_code'], {'qb': 'N/D', 'outs': 'N/D'})
+        home_pts.append(injury_points(ih['qb'], ih['outs']))
+        away_pts.append(injury_points(ia['qb'], ia['outs']))
+
+    feats_df['home_inj_pts'] = home_pts
+    feats_df['away_inj_pts'] = away_pts
+    feats_df['inj_diff_pts'] = feats_df['home_inj_pts'] - feats_df['away_inj_pts']  # >0 => local más golpeado
+
+    # 7) Margen y model spread ajustados por lesiones
+    margin_pred_adj = margin_pred_base - feats_df['inj_diff_pts']
+    model_spread_home_adj = -margin_pred_adj
+
+    # 8) Empaquetar y decidir pick (manteniendo NOMBRES para mostrar)
+    out = feats_df.copy()
+    out['home'] = window_df['home'].values             # nombres largos para display
+    out['away'] = window_df['away'].values
+    out['market_spread_home']     = window_df['market_spread_home'].values
+    out['margin_pred_adj']        = margin_pred_adj
+    out['model_spread_home_adj']  = model_spread_home_adj
+
+    out = decide_picks(out)  # sin umbral: TODOS los juegos
+
+    # 9) Armar mensajes (Top-N detallados + menciones rápidas) y enviar
+    msgs = compose_messages(title, out, injuries, chunk_limit=3500)
+    for m in msgs:
+        send_telegram(token, chat_id, m, parse_mode="Markdown")
+
+# --------------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------------
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--batch", choices=["tnf", "weekend"], required=True)
+    args = p.parse_args()
+    main(args.batch)
