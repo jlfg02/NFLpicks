@@ -1,10 +1,15 @@
-# añade/ajusta estas claves
-INJ_SOURCE: "scores_week"   # "scores_week" o "projections"
-INJ_DEBUG: true             # imprime diagnóstico de lesiones en Actions
+TIMEZONE: "America/Tijuana"
+
+# Modelo / formato
+MAX_PICKS_DETAIL: 12
+PROB_ALPHA: 0.22
+
+# Lesiones → puntos
 QB_OUT_PTS: 3.0
 QB_Q_PTS: 1.0
 STARTER_OUT_PTS: 0.3
 INJURY_CAP_PTS: 5.0
-TIMEZONE: "America/Tijuana"
-MAX_PICKS_DETAIL: 12
-PROB_ALPHA: 0.22
+
+# Lesiones → fuente y debug
+INJ_SOURCE: "projections"   # opciones: "scores_week" o "projections"
+INJ_DEBUG: true             # imprime diagnóstico en logs
