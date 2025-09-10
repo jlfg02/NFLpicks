@@ -36,13 +36,26 @@ jobs:
           set -e
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git status --porcelain
-          if ! git diff --quiet --exit-code data/historical_games.csv; then
-            echo "Hay cambios en data/historical_games.csv. Commiteando..."
-            git add data/historical_games.csv
+
+          echo "Contenido de data/:"
+          ls -la data || true
+
+          if [ -f data/historical_games.csv ]; then
+            echo "Filas en CSV (incluye cabecera): $(wc -l < data/historical_games.csv)"
+          else
+            echo "ERROR: data/historical_games.csv no fue creado por el backfill."
+            exit 1
+          fi
+
+          # Staggea SIEMPRE el archivo (incluye caso 'untracked')
+          git add -A data/historical_games.csv
+
+          # Commit solo si hay algo staged que commitear
+          if git diff --cached --quiet; then
+            echo "No hay cambios que commitear."
+          else
+            echo "Hay cambios. Haciendo commit/push..."
             git commit -m "feat(data): backfill 2022-2024 NFL finals"
             git pull --rebase
             git push
-          else
-            echo "No hay cambios"
           fi
