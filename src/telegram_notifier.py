@@ -144,14 +144,27 @@ def sdi_current_season_and_week(key: str):
 def get_injuries_optional(sdi_key: str, team_codes: set) -> dict:
     """
     Retorna dict {code: {'qb': 'healthy|questionable|out'|'N/D', 'outs': N|'N/D'}}.
-    Fuente por CFG['INJ_SOURCE']: 'scores_week' o 'projections'.
+    Lee de CFG['INJ_SOURCE']: 'scores_week' o 'projections'. Si la fuente elegida
+    no trae datos, cae a la otra. Usa heurísticas sobre varios campos de texto.
     """
     src_cfg = str(CFG.get("INJ_SOURCE", "projections")).lower()
-    debug = bool(CFG.get("INJ_DEBUG", True))  # default True para diagnóstico
-
     if not sdi_key or not team_codes:
         return {t: {'qb': 'N/D', 'outs': 'N/D'} for t in team_codes}
 
+    # -------- helpers
+    def _status_text(p):
+        # concatena posibles campos con info de lesión/actividad
+        fields = [
+            'InjuryStatus', 'Status', 'PracticeStatus', 'Practice',
+            'PracticeDescription', 'InjuryNotes', 'Note', 'Description'
+        ]
+        txt = " ".join(str(p.get(f) or "") for f in fields).strip().lower()
+        return txt
+
+    def _team_key(p):
+        return (p.get('Team') or '').upper()
+
+    # -------- descarga desde la(s) fuente(s)
     players = []
     used_source = src_cfg
 
@@ -171,41 +184,57 @@ def get_injuries_optional(sdi_key: str, team_codes: set) -> dict:
         if ok and isinstance(data, list):
             players = data
 
+    # -------- reduce a nuestros equipos y sumariza
     out = {t: {'qb': 'N/D', 'outs': 'N/D'} for t in team_codes}
     teams_seen = set()
+    qb_hits = 0
+    outs_hits = 0
 
     for p in players or []:
-        team = (p.get('Team') or '').upper()
+        team = _team_key(p)
         if team not in out:
             continue
         teams_seen.add(team)
-        status = (p.get('InjuryStatus') or p.get('Status') or '').lower()
-        pos    = (p.get('Position') or '').upper()
 
-        if 'out' in status or 'doubtful' in status:
+        pos = (p.get('Position') or '').upper()
+        txt = _status_text(p)
+
+        # Normaliza etiquetas clave
+        is_out_like = any(tag in txt for tag in [
+            'out for season', 'injured reserve', 'injured-reserve', 'on ir',
+            'ir', 'pup', 'physically unable', 'suspended', 'out', 'doubtful'
+        ])
+        is_questionable_like = any(tag in txt for tag in [
+            'questionable', 'probable', 'limited'
+        ])
+
+        # Conteo de titulares OUT/DOUBTFUL
+        if is_out_like:
+            outs_hits += 1
             out[team]['outs'] = 0 if out[team]['outs'] == 'N/D' else out[team]['outs']
             out[team]['outs'] += 1
 
+        # Estado del QB
         if pos == 'QB':
-            if 'out' in status or 'doubtful' in status:
+            if is_out_like:
                 out[team]['qb'] = 'out'
-            elif 'questionable' in status or 'probable' in status:
+                qb_hits += 1
+            elif is_questionable_like:
                 if out[team]['qb'] != 'out':
                     out[team]['qb'] = 'questionable'
+                    qb_hits += 1
             else:
-                if out[team]['qb'] == 'N/D':
+                if out[team]['qb'] == 'N/D' and txt:
                     out[team]['qb'] = 'healthy'
 
-    # SIEMPRE imprime un resumen para diagnosticar
+    # -------- diagnóstico visible SIEMPRE
     n_players = len(players or [])
-    qb_flag = sum(1 for t,v in out.items() if v['qb'] in ('out','questionable'))
-    outs_pos = sum(1 for t,v in out.items() if isinstance(v['outs'], (int,float)) and v['outs'] > 0)
+    qb_flag = sum(1 for t, v in out.items() if v['qb'] in ('out', 'questionable'))
+    outs_pos = sum(1 for t, v in out.items() if isinstance(v['outs'], (int, float)) and v['outs'] > 0)
     print(f"[inj] source={used_source} players={n_players} teams_with_data={len(teams_seen)} qb_flag={qb_flag} outs_pos={outs_pos}")
-
-    if debug and n_players:
-        sample = list(out.items())[:3]
-        pretty = " | ".join([f"{k}:{v}" for k,v in sample])
-        print(f"[inj] sample {pretty}")
+    sample = list(out.items())[:3]
+    pretty = " | ".join([f"{k}:{v}" for k, v in sample])
+    print(f"[inj] sample {pretty}")
 
     return out
 
