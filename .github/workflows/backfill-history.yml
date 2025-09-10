@@ -1,0 +1,43 @@
+name: Backfill NFL history
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run backfill
+        env:
+          SPORTSDATAIO_KEY: ${{ secrets.SPORTSDATAIO_KEY }}
+        run: |
+          python src/backfill_history.py
+
+      - name: Commit & push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet --exit-code data/historical_games.csv; then
+            git add data/historical_games.csv
+            git commit -m "feat(data): backfill 2022-2024 NFL finals"
+            git push
+          else
+            echo "No hay cambios"
