@@ -1,20 +1,14 @@
 name: NFL Picks to Telegram
 
-permissions:
-  contents: read
-
-concurrency:
-  group: telegram-picks-${{ github.ref }}
-  cancel-in-progress: false
-
 on:
   schedule:
-    # TNF: 09:03 y 09:08 Tijuana aprox (16:03/16:08 UTC cuando Tijuana = UTC-7)
-    - cron: "3 16 * * 4"
-    - cron: "8 16 * * 4"
-    # WEEKEND: 15:05 y 15:10 Tijuana aprox (22:05/22:10 UTC cuando Tijuana = UTC-7)
-    - cron: "5 22 * * 5"
-    - cron: "10 22 * * 5"
+    # TNF: Jueves 09:00 Tijuana (UTC-7/-8) → 16:00 UTC
+    - cron: "0 16 * * 4"
+    # Weekend: Sábado 20:00 Tijuana.
+    # Durante horario de verano Tijuana ≈ UTC-7 → 20:00 local = Domingo 03:00 UTC
+    - cron: "0 3 * * 0"
+    # Durante horario estándar Tijuana ≈ UTC-8 → 20:00 local = Domingo 04:00 UTC
+    - cron: "0 4 * * 0"
   workflow_dispatch:
     inputs:
       batch:
@@ -27,7 +21,6 @@ on:
 jobs:
   picks:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
@@ -41,26 +34,42 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Determina el batch según el disparador
       - name: Determine batch
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "BATCH=${{ inputs.batch }}" >> $GITHUB_ENV
+          elif [ "${{ github.event.schedule }}" = "0 16 * * 4" ]; then
+            echo "BATCH=tnf" >> $GITHUB_ENV
           else
-            # Decide por día local (America/Tijuana)
-            DOW=$(TZ=America/Tijuana date +%u)   # 1=lun ... 7=dom
-            if [ "$DOW" -eq 4 ]; then
-              echo "BATCH=tnf" >> $GITHUB_ENV
-            else
-              echo "BATCH=weekend" >> $GITHUB_ENV
-            fi
+            echo "BATCH=weekend" >> $GITHUB_ENV
           fi
-          echo "Fecha local: $(TZ=America/Tijuana date -Iseconds)"
+
+      # Guard: solo ejecutar Weekend si es sábado 20:00 en America/Tijuana
+      - name: Guard local time (Weekend only)
+        id: guard
+        run: |
+          if [ "$BATCH" != "weekend" ]; then
+            echo "run=1" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          TZ_ID="America/Tijuana"
+          DOW=$(TZ=$TZ_ID date +%u)   # 6 = sábado
+          HOUR=$(TZ=$TZ_ID date +%H)  # 20 = 8pm
+          echo "Local America/Tijuana → DOW=$DOW HOUR=$HOUR"
+          if [ "$DOW" = "6" ] && [ "$HOUR" = "20" ]; then
+            echo "run=1" >> $GITHUB_OUTPUT
+          else
+            echo "run=0" >> $GITHUB_OUTPUT
+          fi
 
       - name: Run notifier
+        if: ${{ steps.guard.outputs.run == '1' || github.event_name == 'workflow_dispatch' }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           ODDS_API_KEY:       ${{ secrets.ODDS_API_KEY }}
           SPORTSDATAIO_KEY:   ${{ secrets.SPORTSDATAIO_KEY }}
         run: |
+          echo "Batch: $BATCH"
           python src/telegram_notifier.py --batch "$BATCH"
