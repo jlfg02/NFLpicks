@@ -146,7 +146,8 @@ def main(batch):
 
     if len(msg_lines) == 1:
         msg_lines.append("PASS — ningún edge ≥ 1.5 pts detectado.")
-
+print("[debug] mensaje generado:")
+print("\n".join(msg_lines))
     send_telegram_message("\n".join(msg_lines))
 
 # ============================================================
